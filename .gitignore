@@ -1,0 +1,27 @@
+# Secrets
+.env
+web_app/.env
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE / local workspace
+.idea/
+.vscode/
+
+# Local helper resources, not part of the resume project
+dev_resources/
+ui.skills/
+常用skills/
+
+# Logs
+*.log
+
+# Generated reports
+web_app/处理结果/*
+!web_app/处理结果/.gitkeep

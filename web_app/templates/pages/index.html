@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Job Fit Agent Web</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='/css/app.css') }}" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="topbar">
+        <div>
+          <p class="eyebrow">Job Fit Agent</p>
+          <h1>简历 JD 匹配分析台</h1>
+        </div>
+        <div class="status">
+          {% if ai_enabled %}
+            本地规则 + 智能复核
+          {% else %}
+            本地规则分析
+          {% endif %}
+        </div>
+      </section>
+
+      <form id="analysis-form" class="workspace" action="/analyze" method="post" enctype="multipart/form-data">
+        <section class="panel jd-panel">
+          <div class="panel-heading">
+            <span class="step">1</span>
+            <h2>投放岗位 JD</h2>
+          </div>
+          <textarea
+            name="jd_text"
+            placeholder="把岗位 JD 粘贴到这里。也可以使用下面的 JD 文件上传。"
+          ></textarea>
+          <label class="file-row">
+            <span>JD 文件</span>
+            <span class="file-control">
+              <input name="jd_file" type="file" accept=".txt,.md,.docx,.pdf,.doc" data-clearable-file />
+              <button type="button" class="clear-file-button" data-clear-file="jd_file" hidden>取消选择</button>
+            </span>
+          </label>
+        </section>
+
+        <section class="panel resume-panel">
+          <div class="panel-heading">
+            <span class="step">2</span>
+            <h2>批量导入简历</h2>
+          </div>
+          <label class="drop-zone">
+            <span class="file-control resume-file-control">
+              <input name="resume_files" type="file" multiple required accept=".docx,.pdf,.doc" data-clearable-file />
+              <button type="button" class="clear-file-button" data-clear-file="resume_files" hidden>取消选择</button>
+            </span>
+            <span class="drop-title">选择多份简历</span>
+            <span class="drop-copy">支持 .docx / .pdf / .doc，旧版 .doc 会尝试用 LibreOffice 或 Word 转换。</span>
+          </label>
+          <div class="hint-grid">
+            <span>批量评分</span>
+            <span>自动排名</span>
+            <span>结果落盘</span>
+          </div>
+        </section>
+
+        <section class="action-band">
+          <label class="ai-toggle">
+            <input name="enable_ai" type="checkbox" value="true" />
+            <span>AI智能分析</span>
+          </label>
+          <button id="submit-button" type="submit">一键处理</button>
+          <p>默认只跑本地规则；勾选后增加专业复核。结果会保存到 <strong>web_app/处理结果</strong>。</p>
+        </section>
+      </form>
+
+      <section id="progress-panel" class="progress-panel" hidden>
+        <div class="progress-copy">
+          <p class="eyebrow">Processing</p>
+          <h2 id="progress-title">正在准备分析</h2>
+          <span id="progress-percent">0%</span>
+        </div>
+        <div class="progress-track" aria-label="处理进度">
+          <div id="progress-bar" class="progress-bar"></div>
+        </div>
+        <ol class="progress-steps">
+          <li data-step="upload">上传文件</li>
+          <li data-step="parse">读取内容</li>
+          <li data-step="score">计算匹配</li>
+          <li data-step="export">生成报告</li>
+        </ol>
+      </section>
+
+      {% if message %}
+        <section class="notice">{{ message }}</section>
+      {% endif %}
+
+      {% if ai_summary %}
+        <section class="ai-summary batch-summary">
+          <h2>智能结构化复核</h2>
+          <p>{{ ai_summary }}</p>
+        </section>
+      {% endif %}
+
+      {% if saved_files %}
+        <section class="saved-files">
+          <h2>已导出结果</h2>
+          <div class="download-row">
+            <a href="/results/{{ saved_files.json }}">下载 JSON</a>
+            <a href="/results/{{ saved_files.markdown }}">下载 Markdown</a>
+            <a href="/results/{{ saved_files.docx }}">下载 Word 详细报告</a>
+            <a href="/results/{{ saved_files.excel }}">下载 Excel 排名表</a>
+            <a class="report-action" href="/ai-report/{{ saved_files.json }}" data-report-action>写汇总报告</a>
+          </div>
+          <div id="report-progress" class="report-progress" hidden>
+            <div class="report-progress-copy">
+              <span id="report-progress-title">正在准备汇总报告</span>
+              <strong id="report-progress-percent">0%</strong>
+            </div>
+            <div class="report-progress-track" aria-label="汇总报告生成进度">
+              <div id="report-progress-bar" class="report-progress-bar"></div>
+            </div>
+          </div>
+          <p id="report-status" class="report-status" aria-live="polite"></p>
+          <section id="report-output" class="report-output" hidden>
+            <h2>候选人汇总报告</h2>
+            <div id="report-content" class="report-content"></div>
+          </section>
+        </section>
+      {% endif %}
+
+      {% if results %}
+        <section class="results">
+          <div class="results-heading">
+            <h2>分析结果</h2>
+            <span>{{ results|length }} 份简历</span>
+          </div>
+
+          <div class="result-list">
+            {% for item in results %}
+              <article class="result-card {% if not item.ok %}failed{% endif %}">
+                <header>
+                  <div>
+                    <p class="filename">
+                      {{ loop.index }}. {{ item.filename }}
+                      {% if item.ai_enhanced %}
+                        <span class="ai-badge">智能复核</span>
+                      {% endif %}
+                    </p>
+                    {% if item.ok %}
+                      <h3>{{ item.score }} 分 · {{ item.level }}</h3>
+                    {% else %}
+                      <h3>读取失败</h3>
+                    {% endif %}
+                  </div>
+                  {% if item.ok %}
+                    <span class="score">{{ item.score }}</span>
+                  {% endif %}
+                </header>
+
+                {% if item.ok %}
+                  <p class="conclusion">{{ item.conclusion }}</p>
+
+                  <div class="result-grid">
+                    <section>
+                      <h4>优势</h4>
+                      <ul>
+                        {% for line in item.strengths %}
+                          <li>{{ line }}</li>
+                        {% endfor %}
+                      </ul>
+                    </section>
+                    <section>
+                      <h4>短板</h4>
+                      <ul>
+                        {% for line in item.gaps %}
+                          <li>{{ line }}</li>
+                        {% endfor %}
+                      </ul>
+                    </section>
+                    <section>
+                      <h4>改进建议</h4>
+                      <ul>
+                        {% for line in item.suggestions %}
+                          <li>{{ line }}</li>
+                        {% endfor %}
+                      </ul>
+                    </section>
+                  </div>
+
+                  <div class="skills">
+                    <p><strong>已匹配：</strong>{{ item.matched_skills }}</p>
+                    <p><strong>缺失：</strong>{{ item.missing_skills }}</p>
+                  </div>
+                {% else %}
+                  <p class="error">{{ item.error }}</p>
+                {% endif %}
+              </article>
+            {% endfor %}
+          </div>
+        </section>
+      {% endif %}
+    </main>
+    <script src="{{ url_for('static', path='/js/progress.js') }}?v=20260604-file-clear-local-confirm"></script>
+  </body>
+</html>

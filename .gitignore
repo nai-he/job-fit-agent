@@ -18,6 +18,11 @@ __pycache__/
 dev_resources/
 ui.skills/
 常用skills/
+novel/
+examples/resumes/
+
+# Temp scripts
+take_screenshots.py
 
 # Logs
 *.log

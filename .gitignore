@@ -20,12 +20,19 @@ ui.skills/
 常用skills/
 novel/
 examples/resumes/
+.job_fit_agent/
 
 # Temp scripts
 take_screenshots.py
 
 # Logs
 *.log
+
+# SQLite databases
+sql/*.db
+sql/*.db-journal
+*.db
+*.db-journal
 
 # Generated reports
 web_app/处理结果/*

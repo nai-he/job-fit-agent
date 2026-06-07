@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -10,11 +11,16 @@ from openai import OpenAI
 
 from prompts import SUMMARY_PROMPT
 from tools import (
+    AgentTraceStep,
+    JobMemoryTool,
+    JobRAGTool,
     ResumeLoadIssue,
+    build_agent_trace_step,
     build_tool_observation,
     compute_match_score,
     extract_candidate_skills,
     extract_job_requirements,
+    format_agent_trace,
     get_jd_text,
     get_resume_texts_safely,
     resolve_resume_paths,
@@ -24,6 +30,7 @@ from tools import (
 DEFAULT_REQUEST = "请分析候选人的简历与目标岗位 JD 的匹配情况，并总结匹配分、优势、短板和改进建议。"
 DEBUG_ENV_VALUES = {"1", "true", "yes", "on", "debug"}
 TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
+DEFAULT_USER_ID = "default_user"
 
 
 SKILL_DISPLAY_NAMES = {
@@ -116,6 +123,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="直接使用内置示例数据运行，不等待交互输入。",
     )
+    parser.add_argument(
+        "--user-id",
+        default=None,
+        help="记忆与 RAG 命名空间。默认读取 JOB_FIT_USER_ID，未配置时使用 default_user。",
+    )
+    parser.add_argument(
+        "--no-memory",
+        action="store_true",
+        help="关闭求职画像记忆读写。",
+    )
+    parser.add_argument(
+        "--no-rag",
+        action="store_true",
+        help="关闭轻量 RAG 索引与检索。",
+    )
     return parser.parse_args(argv)
 
 
@@ -151,7 +173,11 @@ def build_llm_summary_prompt(
     resume_text: str,
     jd_text: str,
     match_result: str,
+    memory_context: str = "",
+    rag_context: str = "",
 ) -> str:
+    memory_block = f"\n历史记忆上下文：\n{memory_context}\n" if memory_context else ""
+    rag_block = f"\nRAG 检索上下文：\n{rag_context}\n" if rag_context else ""
     return f"""
 用户请求：
 {user_prompt}
@@ -164,6 +190,7 @@ def build_llm_summary_prompt(
 
 结构化匹配结果：
 {match_result}
+{memory_block}{rag_block}
 """.strip()
 
 
@@ -322,12 +349,21 @@ def print_llm_summary(
     resume_text: str,
     jd_text: str,
     match_result: str,
+    memory_context: str = "",
+    rag_context: str = "",
 ) -> None:
     if not llm_config or not llm_summary_enabled:
         return
 
     client, model_name = llm_config
-    prompt = build_llm_summary_prompt(user_prompt, resume_text, jd_text, match_result)
+    prompt = build_llm_summary_prompt(
+        user_prompt,
+        resume_text,
+        jd_text,
+        match_result,
+        memory_context=memory_context,
+        rag_context=rag_context,
+    )
     try:
         summary = call_llm_summary(client, model_name, prompt)
     except Exception as error:
@@ -351,6 +387,31 @@ def print_batch_summary(results: list[dict[str, Any]]) -> None:
     for index, item in enumerate(ranked, start=1):
         print(f"{index}. {Path(item['resume_label']).name}：{item['score']} 分，{item['level']}")
     print()
+
+
+def truncate_text(text: str, limit: int = 520) -> str:
+    clean_text = re.sub(r"\s+", " ", str(text)).strip()
+    if len(clean_text) <= limit:
+        return clean_text
+    return f"{clean_text[:limit]}..."
+
+
+def build_trace_observation(tool_name: str, payload: str, limit: int = 520) -> str:
+    return build_tool_observation(tool_name, truncate_text(payload, limit=limit))
+
+
+def build_gap_memory_content(resume_label: str, match_data: dict[str, Any]) -> str:
+    score = int(match_data.get("match_score", 0))
+    level = match_data.get("diagnosis", {}).get("level", "未知")
+    missing = join_skill_names(match_data.get("missing_skills", []), limit=5)
+    matched = join_skill_names(match_data.get("matched_skills", []), limit=5)
+    return f"{Path(resume_label).name} 匹配分 {score}，等级 {level}；已匹配 {matched}；主要短板 {missing}。"
+
+
+def build_rag_query(user_prompt: str, match_data: dict[str, Any]) -> str:
+    matched = join_skill_names(match_data.get("matched_skills", []), limit=6)
+    missing = join_skill_names(match_data.get("missing_skills", []), limit=6)
+    return f"{user_prompt}\n已匹配技能：{matched}\n缺失技能：{missing}\n请检索简历和岗位 JD 中与匹配判断最相关的证据。"
 
 
 def print_debug_flow(
@@ -402,19 +463,143 @@ def analyze_resume(
     user_prompt: str,
     llm_config: tuple[OpenAI, str] | None,
     llm_summary_enabled: bool,
+    memory_tool: JobMemoryTool | None = None,
+    rag_tool: JobRAGTool | None = None,
 ) -> dict[str, Any]:
+    trace: list[AgentTraceStep] = [
+        build_agent_trace_step(
+            "Perception",
+            "先把环境输入转成可分析文本，确认本轮任务的简历和岗位 JD 都已经可读。",
+            "load_text_file / get_jd_text",
+            "接收 resume_text 与 jd_text",
+            f"简历 {Path(resume_label).name}，文本 {len(resume_text)} 字；JD 文本 {len(jd_text)} 字。",
+        )
+    ]
+
+    memory_context = ""
+    if memory_tool:
+        memory_summary = memory_tool.run({"action": "summary", "limit": 3})
+        memory_matches = memory_tool.run({"action": "search", "query": user_prompt, "limit": 3})
+        memory_context = f"记忆摘要：{memory_summary}\n相关历史：{memory_matches}"
+        trace.append(
+            build_agent_trace_step(
+                "Memory",
+                "在正式评分前先查看历史求职画像和上次短板，避免每次分析都从零开始。",
+                "JobMemoryTool",
+                "summary + search",
+                truncate_text(memory_context),
+            )
+        )
+
+    if rag_tool:
+        jd_observation = rag_tool.run(
+            {
+                "action": "add_document",
+                "source": "current_jd",
+                "doc_type": "jd",
+                "text": jd_text,
+                "metadata": {"resume": Path(resume_label).name},
+            }
+        )
+        resume_observation = rag_tool.run(
+            {
+                "action": "add_document",
+                "source": Path(resume_label).name,
+                "doc_type": "resume",
+                "text": resume_text,
+                "metadata": {"batch_index": index},
+            }
+        )
+        trace.append(
+            build_agent_trace_step(
+                "RAG Indexing",
+                "把当前 JD 和简历写入轻量知识库，后续回答可以先检索证据再生成结论。",
+                "JobRAGTool",
+                "add_document(jd) + add_document(resume)",
+                f"{jd_observation} {resume_observation}",
+            )
+        )
+
     candidate_skills = extract_candidate_skills(resume_text)
     job_requirements = extract_job_requirements(jd_text)
     match_result = compute_match_score(candidate_skills, job_requirements)
     match_data = json.loads(match_result)
 
+    trace.extend(
+        [
+            build_agent_trace_step(
+                "Thought",
+                "从简历和岗位 JD 中抽取标准化技能，形成候选人与岗位的结构化表示。",
+                "extract_candidate_skills / extract_job_requirements",
+                "抽取技能画像与岗位要求",
+                truncate_text(f"候选人技能：{candidate_skills}\n岗位要求：{job_requirements}"),
+            ),
+            build_agent_trace_step(
+                "Planning + Tool Selection",
+                "基于岗位技能权重、类别覆盖和缺口项计算匹配度，并决定后续要输出短板和建议。",
+                "compute_match_score",
+                "计算匹配分、优势、短板和类别覆盖",
+                truncate_text(match_result),
+            ),
+        ]
+    )
+
+    rag_context = ""
+    if rag_tool:
+        rag_context = rag_tool.run({"action": "search", "query": build_rag_query(user_prompt, match_data), "limit": 4})
+        trace.append(
+            build_agent_trace_step(
+                "RAG Retrieval",
+                "检索当前简历和 JD 中最相关的证据片段，用于解释为什么这么打分。",
+                "JobRAGTool",
+                "search(query)",
+                truncate_text(rag_context),
+            )
+        )
+
+    if memory_tool:
+        memory_write = memory_tool.run(
+            {
+                "action": "add",
+                "memory_type": "episodic",
+                "content": build_gap_memory_content(resume_label, match_data),
+                "importance": 0.8,
+                "metadata": {
+                    "resume_label": Path(resume_label).name,
+                    "score": int(match_data.get("match_score", 0)),
+                    "level": match_data.get("diagnosis", {}).get("level", "未知"),
+                    "missing_skills": join_skill_names(match_data.get("missing_skills", [])),
+                    "matched_skills": join_skill_names(match_data.get("matched_skills", [])),
+                    "target_role": "AI 应用开发 / Python 后端",
+                },
+            }
+        )
+        trace.append(
+            build_agent_trace_step(
+                "Memory Write",
+                "把本次分析结果写入情景记忆，下次比较简历版本或追踪短板时可以复用。",
+                "JobMemoryTool",
+                "add(episodic)",
+                memory_write,
+            )
+        )
+
     if debug_output:
         print(f"=== 简历 {index}/{total}：{resume_label} ===")
-        print_debug_flow(resume_text, jd_text, candidate_skills, job_requirements, match_result)
+        print(format_agent_trace(trace))
 
     print_simple_report(index, total, resume_label, match_data)
     print_match_details(match_data)
-    print_llm_summary(llm_config, llm_summary_enabled, user_prompt, resume_text, jd_text, match_result)
+    print_llm_summary(
+        llm_config,
+        llm_summary_enabled,
+        user_prompt,
+        resume_text,
+        jd_text,
+        match_result,
+        memory_context=memory_context,
+        rag_context=rag_context,
+    )
 
     diagnosis = match_data.get("diagnosis", {})
     return {
@@ -428,12 +613,15 @@ def main() -> None:
     args = parse_args()
     llm_config = load_llm_client()
     user_prompt = read_user_prompt(args.request, demo=args.demo)
+    user_id = args.user_id or get_optional_env("JOB_FIT_USER_ID") or DEFAULT_USER_ID
     resume_paths_raw = args.resume_files or get_optional_env("RESUME_FILE_PATHS", "RESUME_FILE_PATH")
     resume_dir = args.resume_dir or get_optional_env("RESUME_DIR", "RESUME_FOLDER")
     jd_path = args.jd_file or get_optional_env("JD_FILE_PATH")
     resume_paths = resolve_resume_paths(resume_paths_raw, resume_dir)
     debug_output = args.debug or is_debug_output()
     llm_summary_enabled = args.llm_summary or is_llm_summary_enabled()
+    memory_tool = None if args.no_memory else JobMemoryTool(user_id=user_id)
+    rag_tool = None if args.no_rag else JobRAGTool(namespace=user_id)
 
     print_header(llm_config, resume_paths, jd_path, debug_output, llm_summary_enabled)
 
@@ -454,6 +642,8 @@ def main() -> None:
                 user_prompt=user_prompt,
                 llm_config=llm_config,
                 llm_summary_enabled=llm_summary_enabled,
+                memory_tool=memory_tool,
+                rag_tool=rag_tool,
             )
         )
 

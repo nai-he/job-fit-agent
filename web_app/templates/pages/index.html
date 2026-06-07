@@ -189,6 +189,42 @@
                     <p><strong>已匹配：</strong>{{ item.matched_skills }}</p>
                     <p><strong>缺失：</strong>{{ item.missing_skills }}</p>
                   </div>
+
+                  {% if item.agent_trace %}
+                    <section class="agent-panel">
+                      <h4>Agent 循环</h4>
+                      <ol class="agent-trace">
+                        {% for step in item.agent_trace %}
+                          <li>
+                            <div class="trace-head">
+                              <strong>{{ step.phase }}</strong>
+                              <span>{{ step.tool }}</span>
+                            </div>
+                            <p>{{ step.thought }}</p>
+                            <p class="trace-action">Action：{{ step.action }}</p>
+                            <p class="trace-observation">{{ step.observation }}</p>
+                          </li>
+                        {% endfor %}
+                      </ol>
+                    </section>
+                  {% endif %}
+
+                  {% if item.memory_context or item.rag_context %}
+                    <div class="context-grid">
+                      {% if item.memory_context %}
+                        <details>
+                          <summary>Memory 记忆上下文</summary>
+                          <pre>{{ item.memory_context }}</pre>
+                        </details>
+                      {% endif %}
+                      {% if item.rag_context %}
+                        <details>
+                          <summary>RAG 检索上下文</summary>
+                          <pre>{{ item.rag_context }}</pre>
+                        </details>
+                      {% endif %}
+                    </div>
+                  {% endif %}
                 {% else %}
                   <p class="error">{{ item.error }}</p>
                 {% endif %}

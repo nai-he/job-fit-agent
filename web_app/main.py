@@ -25,13 +25,21 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from app import (  # noqa: E402
+    build_gap_memory_content,
     build_gap_lines,
+    build_rag_query,
     build_strength_lines,
     build_suggestion_lines,
     get_score_comment,
     join_skill_names,
+    truncate_text,
 )
+from database import save_analysis_results  # noqa: E402
 from tools import (  # noqa: E402
+    AgentTraceStep,
+    JobMemoryTool,
+    JobRAGTool,
+    build_agent_trace_step,
     compute_match_score,
     extract_candidate_skills,
     extract_job_requirements,
@@ -41,14 +49,26 @@ from tools import (  # noqa: E402
 
 
 WEB_DIR = Path(__file__).resolve().parent
+APP_NAME = "Job Fit Agent Web"
+APP_SLUG = "job-fit-agent"
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8000
 RESULTS_DIR = WEB_DIR / "处理结果"
 AI_CONFIG_DIR = WEB_DIR / "ai_config"
 RESULTS_DIR.mkdir(exist_ok=True)
 AI_CONFIG_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="Job Fit Agent Web")
+app = FastAPI(title=APP_NAME)
 app.mount("/static", StaticFiles(directory=WEB_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=WEB_DIR / "templates")
+
+
+@app.middleware("http")
+async def add_no_cache_headers(request: Request, call_next: Any) -> Any:
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    return response
 
 
 AI_SYSTEM_PROMPT = """
@@ -84,6 +104,7 @@ AI_MAX_TOKENS = 1800
 AI_REPORT_MAX_TOKENS = 3200
 AI_RESUME_TEXT_LIMIT = 1200
 AI_JD_TEXT_LIMIT = 1500
+DEFAULT_WEB_USER_ID = "web_user"
 
 
 def safe_filename(filename: str | None) -> str:
@@ -505,16 +526,152 @@ def get_level(match_data: dict[str, Any]) -> str:
     return str(diagnosis.get("level", "未知"))
 
 
+def serialize_agent_trace(trace: list[AgentTraceStep]) -> list[dict[str, str]]:
+    return [
+        {
+            "phase": step.phase,
+            "thought": step.thought,
+            "tool": step.tool,
+            "action": step.action,
+            "observation": step.observation,
+        }
+        for step in trace
+    ]
+
+
+def build_web_rag_query(filename: str, match_data: dict[str, Any]) -> str:
+    return build_rag_query(
+        f"分析 {filename} 与岗位 JD 的匹配证据",
+        match_data,
+    )
+
+
 def build_result_item(
     filename: str,
     resume_text: str,
     jd_text: str,
+    memory_tool: JobMemoryTool | None = None,
+    rag_tool: JobRAGTool | None = None,
+    batch_index: int = 1,
 ) -> dict[str, Any]:
+    trace: list[AgentTraceStep] = [
+        build_agent_trace_step(
+            "Perception",
+            "接收 Web 上传的简历和岗位 JD，并转换成可分析文本。",
+            "load_text_file",
+            "读取上传文件",
+            f"简历 {filename}，文本 {len(resume_text)} 字；JD 文本 {len(jd_text)} 字。",
+        )
+    ]
+
+    memory_context = ""
+    if memory_tool:
+        memory_summary = memory_tool.run({"action": "summary", "limit": 3})
+        memory_matches = memory_tool.run({"action": "search", "query": f"{filename} {jd_text[:300]}", "limit": 3})
+        memory_context = f"记忆摘要：{memory_summary}\n相关历史：{memory_matches}"
+        trace.append(
+            build_agent_trace_step(
+                "Memory",
+                "读取用户历史求职画像和过往分析短板，为本轮判断提供连续性。",
+                "JobMemoryTool",
+                "summary + search",
+                truncate_text(memory_context),
+            )
+        )
+
+    if rag_tool:
+        jd_observation = rag_tool.run(
+            {
+                "action": "add_document",
+                "source": f"current_jd_for_{filename}",
+                "doc_type": "jd",
+                "text": jd_text,
+                "metadata": {"filename": filename},
+            }
+        )
+        resume_observation = rag_tool.run(
+            {
+                "action": "add_document",
+                "source": filename,
+                "doc_type": "resume",
+                "text": resume_text,
+                "metadata": {"batch_index": batch_index},
+            }
+        )
+        trace.append(
+            build_agent_trace_step(
+                "RAG Indexing",
+                "把当前简历和 JD 分块写入轻量检索索引，用于后续证据召回。",
+                "JobRAGTool",
+                "add_document(jd) + add_document(resume)",
+                f"{jd_observation} {resume_observation}",
+            )
+        )
+
     candidate_skills = extract_candidate_skills(resume_text)
     job_requirements = extract_job_requirements(jd_text)
     match_result = compute_match_score(candidate_skills, job_requirements)
     match_data = json.loads(match_result)
     score = int(match_data.get("match_score", 0))
+
+    trace.extend(
+        [
+            build_agent_trace_step(
+                "Thought",
+                "抽取候选人技能和岗位要求，形成结构化对比对象。",
+                "extract_candidate_skills / extract_job_requirements",
+                "抽取技能画像与岗位要求",
+                truncate_text(f"候选人技能：{candidate_skills}\n岗位要求：{job_requirements}"),
+            ),
+            build_agent_trace_step(
+                "Planning + Tool Selection",
+                "选择匹配评分工具，根据权重、类别覆盖和缺口项生成可解释分数。",
+                "compute_match_score",
+                "计算匹配分、优势、短板和建议",
+                truncate_text(match_result),
+            ),
+        ]
+    )
+
+    rag_context = ""
+    if rag_tool:
+        rag_context = rag_tool.run({"action": "search", "query": build_web_rag_query(filename, match_data), "limit": 4})
+        trace.append(
+            build_agent_trace_step(
+                "RAG Retrieval",
+                "检索简历和 JD 中最能支撑当前匹配结论的证据片段。",
+                "JobRAGTool",
+                "search(query)",
+                truncate_text(rag_context),
+            )
+        )
+
+    if memory_tool:
+        memory_write = memory_tool.run(
+            {
+                "action": "add",
+                "memory_type": "episodic",
+                "content": build_gap_memory_content(filename, match_data),
+                "importance": 0.8,
+                "metadata": {
+                    "resume_label": filename,
+                    "score": score,
+                    "level": get_level(match_data),
+                    "missing_skills": join_skill_names(match_data.get("missing_skills", [])),
+                    "matched_skills": join_skill_names(match_data.get("matched_skills", [])),
+                    "target_role": "AI 应用开发 / Python 后端",
+                },
+            }
+        )
+        trace.append(
+            build_agent_trace_step(
+                "Memory Write",
+                "把本次候选人分析写入情景记忆，便于后续追踪简历版本和能力短板。",
+                "JobMemoryTool",
+                "add(episodic)",
+                memory_write,
+            )
+        )
 
     result = {
         "filename": filename,
@@ -527,10 +684,55 @@ def build_result_item(
         "suggestions": build_suggestion_lines(match_data),
         "matched_skills": join_skill_names(match_data.get("matched_skills", [])),
         "missing_skills": join_skill_names(match_data.get("missing_skills", [])),
+        "agent_trace": serialize_agent_trace(trace),
+        "memory_context": memory_context,
+        "rag_context": rag_context,
         "raw": match_data,
     }
 
     return result
+
+
+def append_markdown_agent_details(lines: list[str], item: dict[str, Any]) -> None:
+    trace = item.get("agent_trace") or []
+    if trace:
+        lines.extend(["", "### Agent 循环", ""])
+        for step in trace:
+            lines.extend(
+                [
+                    f"- **{step.get('phase', 'Unknown')}**",
+                    f"  - Thought：{step.get('thought', '')}",
+                    f"  - Tool Selection：{step.get('tool', '')}",
+                    f"  - Action：{step.get('action', '')}",
+                    f"  - Observation：{step.get('observation', '')}",
+                ]
+            )
+
+    if item.get("memory_context"):
+        lines.extend(["", "### Memory 记忆上下文", "", item["memory_context"], ""])
+
+    if item.get("rag_context"):
+        lines.extend(["", "### RAG 检索上下文", "", item["rag_context"], ""])
+
+
+def append_docx_agent_details(document: Document, item: dict[str, Any]) -> None:
+    trace = item.get("agent_trace") or []
+    if trace:
+        document.add_heading("Agent 循环", level=3)
+        for step in trace:
+            document.add_paragraph(str(step.get("phase", "Unknown")), style="List Bullet")
+            document.add_paragraph(f"Thought：{step.get('thought', '')}")
+            document.add_paragraph(f"Tool Selection：{step.get('tool', '')}")
+            document.add_paragraph(f"Action：{step.get('action', '')}")
+            document.add_paragraph(f"Observation：{step.get('observation', '')}")
+
+    if item.get("memory_context"):
+        document.add_heading("Memory 记忆上下文", level=3)
+        document.add_paragraph(str(item["memory_context"]))
+
+    if item.get("rag_context"):
+        document.add_heading("RAG 检索上下文", level=3)
+        document.add_paragraph(str(item["rag_context"]))
 
 
 def write_markdown_report(payload: dict[str, Any], path: Path) -> None:
@@ -566,6 +768,7 @@ def write_markdown_report(payload: dict[str, Any], path: Path) -> None:
         lines.extend(f"- {line}" for line in item["gaps"])
         lines.extend(["", "### 改进建议", ""])
         lines.extend(f"- {line}" for line in item["suggestions"])
+        append_markdown_agent_details(lines, item)
         lines.append("")
 
     if payload.get("ai_summary"):
@@ -612,6 +815,8 @@ def write_docx_report(payload: dict[str, Any], path: Path) -> None:
         if item.get("ai_summary"):
             document.add_heading("AI 补充分析", level=3)
             document.add_paragraph(item["ai_summary"])
+
+        append_docx_agent_details(document, item)
 
     document.save(path)
 
@@ -685,6 +890,16 @@ def sort_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(results, key=lambda item: item.get("score", -1), reverse=True)
 
 
+@app.get("/health")
+async def health() -> dict[str, Any]:
+    return {
+        "app": APP_SLUG,
+        "name": APP_NAME,
+        "project_root": str(ROOT_DIR),
+        "memory_rag_enabled": True,
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(
@@ -709,6 +924,12 @@ async def analyze(
 ) -> HTMLResponse:
     messages: list[str] = []
     results: list[dict[str, Any]] = []
+    resume_texts: dict[str, str] = {}
+    user_id = get_optional_env("JOB_FIT_USER_ID", "WEB_USER_ID") or DEFAULT_WEB_USER_ID
+    memory_tool = JobMemoryTool(user_id=user_id)
+    rag_tool = JobRAGTool(namespace=f"web_{user_id}")
+    rag_tool.run({"action": "clear"})
+    messages.append("已启用轻量 Memory 与 RAG：本轮结果会写入求职画像记忆，并从当前 JD / 简历检索证据。")
 
     with tempfile.TemporaryDirectory() as temp_dir_name:
         temp_dir = Path(temp_dir_name)
@@ -732,7 +953,17 @@ async def analyze(
             try:
                 resume_path = save_upload(upload, temp_dir)
                 resume_text = load_text_file(resume_path)
-                results.append(build_result_item(filename, resume_text, jd_content))
+                resume_texts[filename] = resume_text
+                results.append(
+                    build_result_item(
+                        filename,
+                        resume_text,
+                        jd_content,
+                        memory_tool=memory_tool,
+                        rag_tool=rag_tool,
+                        batch_index=len(results) + 1,
+                    )
+                )
             except Exception as error:
                 results.append(
                     {
@@ -753,6 +984,16 @@ async def analyze(
             ai_summary = f"AI 批量分析失败：{error}"
 
     saved_files = save_analysis_files(ranked_results, jd_source, enable_ai, ai_summary)
+    try:
+        saved_count = save_analysis_results(
+            jd_source=jd_source,
+            jd_text=jd_content,
+            results=ranked_results,
+            resume_texts=resume_texts,
+        )
+        messages.append(f"已写入 SQLite 数据库 {saved_count} 条成功匹配记录。")
+    except Exception as error:
+        messages.append(f"SQLite 持久化失败，已保留导出文件：{error}")
 
     return templates.TemplateResponse(
         "pages/index.html",
@@ -803,14 +1044,29 @@ async def generate_ai_report(json_filename: str) -> JSONResponse:
     return JSONResponse({"report": report_text, "markdown": md_path.name})
 
 
-if __name__ == "__main__":
+def port_is_free(port: int, host: str = DEFAULT_HOST) -> bool:
     import socket
 
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        return sock.connect_ex((host, port)) != 0
+
+
+def find_available_port(start_port: int = DEFAULT_PORT, host: str = DEFAULT_HOST) -> int:
+    port = start_port
+    while not port_is_free(port, host):
+        port += 1
+    return port
+
+
+if __name__ == "__main__":
     import uvicorn
 
-    def port_is_free(port: int) -> bool:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            return sock.connect_ex(("127.0.0.1", port)) != 0
-
-    port = 8000 if port_is_free(8000) else 8010
-    uvicorn.run(app, host="127.0.0.1", port=port)
+    requested_port = int(os.getenv("WEB_APP_PORT", str(DEFAULT_PORT)))
+    port = find_available_port(requested_port)
+    url = f"http://{DEFAULT_HOST}:{port}"
+    if port != requested_port:
+        print(f"{APP_NAME} requested port {requested_port} is busy; using {url}", flush=True)
+    else:
+        print(f"{APP_NAME} is running at {url}", flush=True)
+    print(f"Health check: {url}/health", flush=True)
+    uvicorn.run(app, host=DEFAULT_HOST, port=port)

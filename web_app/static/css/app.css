@@ -618,6 +618,94 @@ ul {
   line-height: 1.6;
 }
 
+.agent-panel {
+  margin-top: 16px;
+  border-top: 1px solid var(--line);
+  padding-top: 14px;
+}
+
+.agent-panel h4 {
+  margin-bottom: 10px;
+}
+
+.agent-trace {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.agent-trace li {
+  border: 1px solid rgba(49, 93, 124, 0.2);
+  background: rgba(49, 93, 124, 0.05);
+  padding: 12px;
+}
+
+.trace-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.trace-head strong {
+  color: var(--blue);
+}
+
+.trace-head span {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.agent-trace p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.trace-action {
+  margin-top: 6px !important;
+  color: var(--accent-strong) !important;
+  font-weight: 700;
+}
+
+.trace-observation {
+  margin-top: 6px !important;
+  overflow-wrap: anywhere;
+}
+
+.context-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.context-grid details {
+  border: 1px solid var(--line);
+  background: #fbfcf8;
+  padding: 10px 12px;
+}
+
+.context-grid summary {
+  color: var(--accent-strong);
+  cursor: pointer;
+  font-weight: 800;
+}
+
+.context-grid pre {
+  max-height: 220px;
+  overflow: auto;
+  margin: 10px 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font: 13px/1.55 Consolas, "Microsoft YaHei", monospace;
+}
+
 .ai-summary {
   margin-top: 16px;
   border-left: 4px solid var(--warm);
@@ -659,7 +747,8 @@ ul {
   }
 
   .workspace,
-  .result-grid {
+  .result-grid,
+  .context-grid {
     grid-template-columns: 1fr;
   }
 

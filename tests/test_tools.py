@@ -4,6 +4,8 @@ import unittest
 from pathlib import Path
 
 from tools import (
+    JobMemoryTool,
+    JobRAGTool,
     compute_match_score,
     extract_candidate_skills,
     extract_job_requirements,
@@ -95,6 +97,58 @@ class MatchScoreTest(unittest.TestCase):
             self.assertEqual(load_pdf_file("resume.pdf"), "Python FastAPI\nRAG")
         finally:
             tools.PdfReader = original_reader
+
+
+class LightweightMemoryAndRAGTest(unittest.TestCase):
+    def test_memory_tool_persists_and_searches_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            memory_path = Path(temp_dir) / "memory.json"
+            memory = JobMemoryTool(memory_path=memory_path, user_id="tester")
+            memory.run(
+                {
+                    "action": "add",
+                    "memory_type": "episodic",
+                    "content": "张三简历缺少 Docker 和向量数据库实践",
+                    "importance": 0.9,
+                    "metadata": {
+                        "score": 72,
+                        "missing_skills": "Docker、Vector Database",
+                    },
+                }
+            )
+
+            summary = json.loads(memory.run({"action": "summary"}))
+            search_result = json.loads(memory.run({"action": "search", "query": "Docker 短板"}))
+
+            self.assertEqual(summary["event_count"], 1)
+            self.assertEqual(summary["profile"]["last_score"], 72)
+            self.assertEqual(search_result["matches"][0]["content"], "张三简历缺少 Docker 和向量数据库实践")
+
+    def test_rag_tool_indexes_and_retrieves_relevant_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            index_path = Path(temp_dir) / "rag.json"
+            rag = JobRAGTool(index_path=index_path, namespace="tester")
+            rag.run(
+                {
+                    "action": "add_document",
+                    "source": "resume.md",
+                    "doc_type": "resume",
+                    "text": "候选人熟悉 Python 和 FastAPI，做过 RAG 检索增强问答项目。",
+                }
+            )
+            rag.run(
+                {
+                    "action": "add_document",
+                    "source": "jd.md",
+                    "doc_type": "jd",
+                    "text": "岗位要求 Docker 部署、向量数据库和 RAG 项目经验。",
+                }
+            )
+
+            result = json.loads(rag.run({"action": "search", "query": "RAG 项目经验", "limit": 2}))
+
+            self.assertGreaterEqual(len(result["matches"]), 1)
+            self.assertIn("RAG", result["matches"][0]["text"])
 
 
 if __name__ == "__main__":

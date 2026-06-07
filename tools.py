@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +25,11 @@ BASE_DIR = Path(__file__).resolve().parent
 EXAMPLES_DIR = BASE_DIR / "examples"
 DEFAULT_RESUME_DIR = EXAMPLES_DIR / "resumes"
 SUPPORTED_RESUME_SUFFIXES = {".docx", ".pdf", ".doc"}
+DEFAULT_AGENT_DATA_DIR = BASE_DIR / ".job_fit_agent"
+DEFAULT_MEMORY_PATH = DEFAULT_AGENT_DATA_DIR / "memory.json"
+DEFAULT_RAG_INDEX_PATH = DEFAULT_AGENT_DATA_DIR / "rag_index.json"
+RAG_CHUNK_SIZE = 420
+RAG_CHUNK_OVERLAP = 80
 
 
 @dataclass(frozen=True)
@@ -37,6 +44,15 @@ class SkillSpec:
 class ResumeLoadIssue:
     path: str
     reason: str
+
+
+@dataclass(frozen=True)
+class AgentTraceStep:
+    phase: str
+    thought: str
+    tool: str
+    action: str
+    observation: str
 
 
 SKILL_CATALOG: tuple[SkillSpec, ...] = (
@@ -514,3 +530,333 @@ def parse_skill_payload(raw_value: str, field_name: str) -> dict[str, Any]:
 
 def build_tool_observation(tool_name: str, payload: str) -> str:
     return f"Observation: 工具 {tool_name} 返回 -> {payload}"
+
+
+def ensure_agent_data_dir(path: Path = DEFAULT_AGENT_DATA_DIR) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def load_json_file(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return default
+
+
+def write_json_file(path: Path, data: Any) -> None:
+    ensure_agent_data_dir(path.parent)
+    temp_path = path.with_suffix(f"{path.suffix}.tmp")
+    temp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(path)
+
+
+def tokenize_text(text: str) -> list[str]:
+    tokens = re.findall(r"[A-Za-z][A-Za-z0-9_+#.-]*|[\u4e00-\u9fff]{2,}", text.lower())
+    return [token for token in tokens if len(token.strip()) >= 2]
+
+
+def split_text_chunks(text: str, chunk_size: int = RAG_CHUNK_SIZE, overlap: int = RAG_CHUNK_OVERLAP) -> list[str]:
+    clean_text = re.sub(r"\s+", " ", text).strip()
+    if not clean_text:
+        return []
+
+    chunks = []
+    start = 0
+    while start < len(clean_text):
+        end = min(start + chunk_size, len(clean_text))
+        chunk = clean_text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if end >= len(clean_text):
+            break
+        start = max(end - overlap, start + 1)
+    return chunks
+
+
+def compact_json(data: Any, limit: int = 800) -> str:
+    text = json.dumps(data, ensure_ascii=False, indent=2)
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}..."
+
+
+class JobMemoryTool:
+    """Lightweight project memory: stores user goals and past match summaries."""
+
+    def __init__(self, memory_path: str | Path = DEFAULT_MEMORY_PATH, user_id: str = "default") -> None:
+        self.memory_path = Path(memory_path)
+        self.user_id = user_id
+
+    def run(self, payload: dict[str, Any]) -> str:
+        action = str(payload.get("action", "")).strip().lower()
+        if action == "add":
+            return self.add(payload)
+        if action == "search":
+            return self.search(str(payload.get("query", "")), int(payload.get("limit", 3)))
+        if action == "summary":
+            return self.summary(int(payload.get("limit", 5)))
+        if action == "clear":
+            return self.clear()
+        raise ValueError(f"不支持的记忆操作：{action}")
+
+    def load(self) -> dict[str, Any]:
+        data = load_json_file(self.memory_path, {"users": {}})
+        if not isinstance(data, dict):
+            data = {"users": {}}
+        users = data.setdefault("users", {})
+        if not isinstance(users, dict):
+            data["users"] = {}
+        data["users"].setdefault(self.user_id, {"profile": {}, "events": []})
+        return data
+
+    def save(self, data: dict[str, Any]) -> None:
+        write_json_file(self.memory_path, data)
+
+    def add(self, payload: dict[str, Any]) -> str:
+        data = self.load()
+        user_memory = data["users"][self.user_id]
+        event = {
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "memory_type": payload.get("memory_type", "episodic"),
+            "content": str(payload.get("content", "")).strip(),
+            "importance": float(payload.get("importance", 0.6)),
+            "metadata": payload.get("metadata", {}),
+        }
+        if not event["content"]:
+            return "未写入记忆：content 为空。"
+
+        user_memory.setdefault("events", []).append(event)
+        self._update_profile(user_memory, event)
+        self.save(data)
+        return f"已写入 {event['memory_type']} 记忆：{event['content']}"
+
+    def search(self, query: str, limit: int = 3) -> str:
+        data = self.load()
+        events = data["users"][self.user_id].get("events", [])
+        query_tokens = set(tokenize_text(query))
+        scored = []
+        for event in events:
+            text = f"{event.get('content', '')} {json.dumps(event.get('metadata', {}), ensure_ascii=False)}"
+            tokens = set(tokenize_text(text))
+            overlap = len(query_tokens & tokens)
+            importance = float(event.get("importance", 0.0))
+            if overlap or not query_tokens:
+                scored.append((overlap + importance * 0.2, event))
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        matches = [event for _, event in scored[:limit]]
+        return compact_json({"query": query, "matches": matches})
+
+    def summary(self, limit: int = 5) -> str:
+        data = self.load()
+        user_memory = data["users"][self.user_id]
+        events = user_memory.get("events", [])
+        latest = sorted(events, key=lambda item: item.get("created_at", ""), reverse=True)[:limit]
+        return compact_json(
+            {
+                "user_id": self.user_id,
+                "profile": user_memory.get("profile", {}),
+                "event_count": len(events),
+                "latest_events": latest,
+            }
+        )
+
+    def clear(self) -> str:
+        data = self.load()
+        data["users"][self.user_id] = {"profile": {}, "events": []}
+        self.save(data)
+        return f"已清空用户 {self.user_id} 的记忆。"
+
+    def _update_profile(self, user_memory: dict[str, Any], event: dict[str, Any]) -> None:
+        metadata = event.get("metadata", {})
+        if not isinstance(metadata, dict):
+            return
+
+        profile = user_memory.setdefault("profile", {})
+        target_role = metadata.get("target_role")
+        if target_role:
+            profile["target_role"] = target_role
+
+        missing_skills = metadata.get("missing_skills")
+        if missing_skills:
+            profile["recent_gaps"] = missing_skills
+
+        score = metadata.get("score")
+        if score is not None:
+            profile["last_score"] = score
+
+
+class JobRAGTool:
+    """Lightweight TF-IDF RAG tool for resumes, JDs, and historical snippets."""
+
+    def __init__(self, index_path: str | Path = DEFAULT_RAG_INDEX_PATH, namespace: str = "default") -> None:
+        self.index_path = Path(index_path)
+        self.namespace = namespace
+
+    def run(self, payload: dict[str, Any]) -> str:
+        action = str(payload.get("action", "")).strip().lower()
+        if action == "add_document":
+            return self.add_document(
+                source=str(payload.get("source", "unknown")),
+                text=str(payload.get("text", "")),
+                doc_type=str(payload.get("doc_type", "document")),
+                metadata=payload.get("metadata", {}),
+            )
+        if action == "search":
+            return self.search(str(payload.get("query", "")), int(payload.get("limit", 3)))
+        if action == "clear":
+            return self.clear()
+        raise ValueError(f"不支持的 RAG 操作：{action}")
+
+    def load(self) -> dict[str, Any]:
+        data = load_json_file(self.index_path, {"namespaces": {}})
+        if not isinstance(data, dict):
+            data = {"namespaces": {}}
+        namespaces = data.setdefault("namespaces", {})
+        if not isinstance(namespaces, dict):
+            data["namespaces"] = {}
+        data["namespaces"].setdefault(self.namespace, {"chunks": []})
+        return data
+
+    def save(self, data: dict[str, Any]) -> None:
+        write_json_file(self.index_path, data)
+
+    def add_document(
+        self,
+        source: str,
+        text: str,
+        doc_type: str = "document",
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        chunks = split_text_chunks(text)
+        if not chunks:
+            return f"未写入 RAG 索引：{source} 内容为空。"
+
+        data = self.load()
+        namespace_data = data["namespaces"][self.namespace]
+        existing_chunks = namespace_data.setdefault("chunks", [])
+        existing_chunks[:] = [
+            chunk for chunk in existing_chunks if chunk.get("source") != source or chunk.get("doc_type") != doc_type
+        ]
+
+        created_at = datetime.now().isoformat(timespec="seconds")
+        for index, chunk in enumerate(chunks, start=1):
+            existing_chunks.append(
+                {
+                    "id": f"{source}:{doc_type}:{index}",
+                    "source": source,
+                    "doc_type": doc_type,
+                    "chunk_index": index,
+                    "text": chunk,
+                    "tokens": tokenize_text(chunk),
+                    "metadata": metadata or {},
+                    "created_at": created_at,
+                }
+            )
+
+        self.save(data)
+        return f"已写入 RAG 索引：{source}，类型 {doc_type}，分块 {len(chunks)} 个。"
+
+    def search(self, query: str, limit: int = 3) -> str:
+        data = self.load()
+        chunks = data["namespaces"][self.namespace].get("chunks", [])
+        matches = self._rank_chunks(query, chunks, limit)
+        return compact_json({"query": query, "matches": matches}, limit=1200)
+
+    def clear(self) -> str:
+        data = self.load()
+        data["namespaces"][self.namespace] = {"chunks": []}
+        self.save(data)
+        return f"已清空命名空间 {self.namespace} 的 RAG 索引。"
+
+    def _rank_chunks(self, query: str, chunks: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+        query_tokens = tokenize_text(query)
+        if not query_tokens or not chunks:
+            return []
+
+        document_frequency: dict[str, int] = {}
+        for chunk in chunks:
+            for token in set(chunk.get("tokens", [])):
+                document_frequency[token] = document_frequency.get(token, 0) + 1
+
+        total_documents = len(chunks)
+        query_vector = self._tfidf_vector(query_tokens, document_frequency, total_documents)
+        scored = []
+        for chunk in chunks:
+            chunk_tokens = list(chunk.get("tokens", []))
+            chunk_vector = self._tfidf_vector(chunk_tokens, document_frequency, total_documents)
+            score = cosine_similarity(query_vector, chunk_vector)
+            if score <= 0:
+                continue
+            scored.append((score, chunk))
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [
+            {
+                "score": round(score, 4),
+                "source": chunk.get("source"),
+                "doc_type": chunk.get("doc_type"),
+                "chunk_index": chunk.get("chunk_index"),
+                "text": chunk.get("text"),
+                "metadata": chunk.get("metadata", {}),
+            }
+            for score, chunk in scored[:limit]
+        ]
+
+    def _tfidf_vector(
+        self,
+        tokens: list[str],
+        document_frequency: dict[str, int],
+        total_documents: int,
+    ) -> dict[str, float]:
+        term_frequency: dict[str, int] = {}
+        for token in tokens:
+            term_frequency[token] = term_frequency.get(token, 0) + 1
+
+        vector = {}
+        for token, count in term_frequency.items():
+            idf = math.log((1 + total_documents) / (1 + document_frequency.get(token, 0))) + 1
+            vector[token] = count * idf
+        return vector
+
+
+def cosine_similarity(left: dict[str, float], right: dict[str, float]) -> float:
+    shared_tokens = set(left) & set(right)
+    if not shared_tokens:
+        return 0.0
+
+    numerator = sum(left[token] * right[token] for token in shared_tokens)
+    left_norm = math.sqrt(sum(value * value for value in left.values()))
+    right_norm = math.sqrt(sum(value * value for value in right.values()))
+    if not left_norm or not right_norm:
+        return 0.0
+    return numerator / (left_norm * right_norm)
+
+
+def build_agent_trace_step(phase: str, thought: str, tool: str, action: str, observation: str) -> AgentTraceStep:
+    return AgentTraceStep(
+        phase=phase,
+        thought=thought,
+        tool=tool,
+        action=action,
+        observation=observation,
+    )
+
+
+def format_agent_trace(trace: list[AgentTraceStep]) -> str:
+    lines = []
+    for index, step in enumerate(trace, start=1):
+        lines.extend(
+            [
+                f"--- Agent 循环 {index}: {step.phase} ---",
+                f"Thought: {step.thought}",
+                f"Tool Selection: {step.tool}",
+                f"Action: {step.action}",
+                f"Observation: {step.observation}",
+                "=" * 60,
+            ]
+        )
+    return "\n".join(lines)

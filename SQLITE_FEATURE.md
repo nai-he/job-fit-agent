@@ -1,270 +1,135 @@
-# SQLite 数据库功能说明
+# SQLite 结果持久化说明
 
-## 概述
+`Job Fit Agent` 的 Web 分析流程会在生成页面结果和导出文件后，将成功匹配的记录写入 SQLite。这个模块用于沉淀历史分析批次，方便后续做 SQL 查询、候选人对比、统计看板或历史记录页面。
 
-项目已成功集成 SQLite 数据库功能，用于持久化存储简历匹配分析结果。
+## 设计目标
 
-## 功能特性
+- 保留每次分析的 JD、简历文本和匹配结果。
+- 使用三表结构表达岗位、简历和匹配关系。
+- 通过事务写入，避免部分记录保存失败导致数据不一致。
+- 保持部署简单：SQLite 是本地单文件数据库，不需要额外服务。
 
-### 1. 数据库结构
+## 数据表
 
-数据库包含三张主表：
+### `jobs`
 
-#### jobs 表（岗位信息）
-- `id`: 主键
-- `source`: JD 来源（文件名或描述）
-- `jd_text`: 岗位描述文本
-- `created_at`: 创建时间
+保存岗位信息。
 
-#### resumes 表（简历信息）
-- `id`: 主键
-- `filename`: 简历文件名
-- `resume_text`: 简历文本内容
-- `created_at`: 创建时间
+- `id`：主键
+- `source`：JD 来源，例如上传文件名或“页面粘贴 JD”
+- `jd_text`：岗位描述文本
+- `created_at`：创建时间
 
-#### matches 表（匹配结果）
-- `id`: 主键
-- `job_id`: 关联岗位 ID（外键）
-- `resume_id`: 关联简历 ID（外键）
-- `score`: 匹配分数（0-100）
-- `level`: 匹配等级（高匹配/中等匹配/低匹配）
-- `conclusion`: 一句话结论
-- `matched_skills`: 已匹配技能（逗号分隔）
-- `missing_skills`: 缺失技能（逗号分隔）
-- `strengths_json`: 优势列表（JSON 格式）
-- `gaps_json`: 短板列表（JSON 格式）
-- `suggestions_json`: 改进建议（JSON 格式）
-- `raw_json`: 完整原始数据（JSON 格式）
-- `created_at`: 创建时间
+### `resumes`
 
-### 2. 核心 API
+保存简历信息。
 
-#### `init_db(db_path=None) -> Path`
-初始化数据库，自动创建表结构和索引。
+- `id`：主键
+- `filename`：简历文件名
+- `resume_text`：简历全文
+- `created_at`：创建时间
+
+### `matches`
+
+保存岗位与简历之间的一次匹配结果。
+
+- `id`：主键
+- `job_id`：关联 `jobs.id`
+- `resume_id`：关联 `resumes.id`
+- `score`：匹配分
+- `level`：匹配等级
+- `conclusion`：一句话结论
+- `matched_skills`：已匹配技能
+- `missing_skills`：缺失技能
+- `strengths_json`：优势列表
+- `gaps_json`：短板列表
+- `suggestions_json`：改进建议
+- `raw_json`：完整结构化匹配结果
+- `created_at`：创建时间
+
+表结构定义见 [sql/schema.sql](sql/schema.sql)，常用查询见 [sql/queries.sql](sql/queries.sql)。
+
+## 核心接口
+
+### 初始化数据库
 
 ```python
 from database import init_db
 
-# 使用默认路径 sql/job_fit.db
 db_path = init_db()
-
-# 或指定自定义路径
-db_path = init_db("/path/to/custom.db")
+print(db_path)
 ```
 
-#### `save_analysis_results(...) -> int`
-保存批量分析结果到数据库。
+默认路径是 `sql/job_fit.db`。如果需要自定义路径，可以设置环境变量：
+
+```text
+JOB_FIT_DB_PATH=./data/job_fit.db
+```
+
+### 保存分析结果
 
 ```python
 from database import save_analysis_results
 
 saved_count = save_analysis_results(
-    jd_source="AI工程师.md",
-    jd_text="需要Python、FastAPI、LLM经验",
-    results=[
-        {
-            "filename": "张三.pdf",
-            "ok": True,
-            "score": 85,
-            "level": "高匹配",
-            "conclusion": "非常适合",
-            "matched_skills": "Python、FastAPI",
-            "missing_skills": "Docker",
-            "strengths": ["Python基础扎实"],
-            "gaps": ["缺少Docker经验"],
-            "suggestions": ["补充容器化实践"],
-            "raw": {"match_score": 85}
-        }
-    ],
-    resume_texts={"张三.pdf": "简历全文..."}
+    jd_source="页面粘贴 JD",
+    jd_text="需要 Python、FastAPI、LLM 应用经验",
+    results=ranked_results,
+    resume_texts={
+        "candidate.docx": "简历全文..."
+    },
 )
 ```
 
-#### `connect_db(db_path=None) -> sqlite3.Connection`
-连接数据库，自动启用外键约束和 Row 工厂。
+Web 端已经在 `/analyze` 流程中调用该接口。保存失败不会影响页面结果和报告导出，系统会在页面提示 SQLite 持久化失败原因。
+
+### 查询数据库
 
 ```python
 from database import connect_db
 
 conn = connect_db()
 try:
-    rows = conn.execute("SELECT * FROM matches").fetchall()
-    for row in rows:
-        print(row["filename"], row["score"])
+    rows = conn.execute("""
+        SELECT resumes.filename, matches.score, matches.level
+        FROM matches
+        JOIN resumes ON matches.resume_id = resumes.id
+        ORDER BY matches.created_at DESC
+    """).fetchall()
 finally:
     conn.close()
 ```
 
-### 3. 配置方式
+## 验证方式
 
-可通过环境变量指定数据库路径：
-
-```bash
-# .env 文件
-JOB_FIT_DB_PATH=./custom_path/job_fit.db
-```
-
-或使用默认路径：`sql/job_fit.db`
-
-## 使用示例
-
-### 快速开始
+运行数据库单元测试：
 
 ```bash
-# 1. 运行示例代码
-python example_use_database.py
-
-# 2. 运行测试
-python -m unittest tests.test_database
-```
-
-### 常用 SQL 查询
-
-项目提供了常用查询示例：`sql/queries.sql`
-
-```sql
--- 查看最近的匹配记录
-SELECT
-    matches.id,
-    resumes.filename,
-    jobs.source AS jd_source,
-    matches.score,
-    matches.level,
-    matches.created_at
-FROM matches
-JOIN resumes ON matches.resume_id = resumes.id
-JOIN jobs ON matches.job_id = jobs.id
-ORDER BY matches.created_at DESC;
-
--- 查看高匹配候选人（分数 >= 80）
-SELECT
-    resumes.filename,
-    matches.score,
-    matches.matched_skills,
-    matches.missing_skills
-FROM matches
-JOIN resumes ON matches.resume_id = resumes.id
-WHERE matches.score >= 80
-ORDER BY matches.score DESC;
-
--- 按匹配等级统计数量
-SELECT level, COUNT(*) AS total
-FROM matches
-GROUP BY level
-ORDER BY total DESC;
-```
-
-## 文件结构
-
-```
-job-fit-agent/
-├── database.py                 # 数据库操作核心模块
-├── sql/
-│   ├── schema.sql             # 数据库表结构定义
-│   ├── queries.sql            # 常用查询示例
-│   ├── job_fit.db             # 数据库文件（自动生成，已忽略）
-│   └── README.md              # SQL 目录说明
-├── tests/
-│   └── test_database.py       # 数据库功能测试
-└── example_use_database.py    # 使用示例代码
-```
-
-## 数据库工具推荐
-
-### 1. DB Browser for SQLite
-免费的图形化 SQLite 工具，支持浏览、查询、导出数据。
-
-下载地址：https://sqlitebrowser.org/
-
-### 2. PyCharm 数据库工具
-PyCharm 内置的数据库工具，支持 SQL 自动补全和查询执行。
-
-使用方式：
-1. 打开 Database 工具窗口
-2. 添加 Data Source → SQLite
-3. 选择 `sql/job_fit.db` 文件
-
-### 3. SQLite CLI（命令行）
-```bash
-# 安装（Windows）
-# 下载 sqlite-tools-win32 from https://www.sqlite.org/download.html
-
-# 使用
-sqlite3 sql/job_fit.db
-sqlite> .tables
-sqlite> SELECT * FROM matches;
-```
-
-## 与 JSON 存储的对比
-
-| 特性 | SQLite | JSON 文件 |
-|------|--------|-----------|
-| **查询能力** | ✅ 强大的 SQL 查询 | ❌ 需要加载全部数据 |
-| **性能** | ✅ 索引优化，大数据量高效 | ❌ 数据量大时性能下降 |
-| **并发** | ✅ 支持并发读写 | ❌ 容易冲突 |
-| **关系查询** | ✅ 支持 JOIN、聚合 | ❌ 需要手动实现 |
-| **数据完整性** | ✅ 外键约束、事务 | ❌ 依赖代码保证 |
-| **部署简单** | ✅ 单文件，无需服务 | ✅ 单文件 |
-| **可读性** | ⚠️ 需要工具查看 | ✅ 直接打开 |
-
-## 集成到 Web 应用
-
-可以在 `web_app/main.py` 中集成数据库保存：
-
-```python
-from database import save_analysis_results
-
-@app.post("/api/analyze")
-async def analyze_endpoint(...):
-    # ... 执行分析 ...
-    
-    # 保存到数据库
-    save_analysis_results(
-        jd_source=jd_filename,
-        jd_text=jd_text,
-        results=all_results,
-        resume_texts=resume_texts_dict
-    )
-    
-    return all_results
-```
-
-## 测试验证
-
-```bash
-# 运行单元测试
 python -m unittest tests.test_database -v
-
-# 预期输出
-test_save_analysis_results_persists_match_record ... ok
-
-----------------------------------------------------------------------
-Ran 1 test in 0.044s
-
-OK
 ```
 
-## 注意事项
+运行示例脚本：
 
-1. **数据库文件已添加到 `.gitignore`**，不会提交到版本控制
-2. **首次使用会自动创建数据库和表结构**
-3. **支持外键约束**，删除 job 或 resume 会级联删除相关 matches
-4. **默认使用本地时间**，`created_at` 字段自动填充
+```bash
+python example_use_database.py
+```
 
-## 恢复历史
+运行完整测试：
 
-SQLite 功能从 git stash 恢复，对应提交：
-- Stash: `stash@{0}: On master: before restoring accidental sqlite changes`
-- Commit: `ae5908d`
+```bash
+python -m unittest discover -s tests -v
+```
 
-## 下一步建议
+## 与 Memory 的区别
 
-1. ✅ 已恢复基础 SQLite 功能
-2. 🔲 集成到 Web 应用的保存逻辑
-3. 🔲 添加数据查询和导出 API
-4. 🔲 实现历史记录对比功能
-5. 🔲 添加数据统计和可视化
+SQLite 和轻量 Memory 不是同一层能力：
 
----
+- Memory：保存在 `.job_fit_agent/memory.json`，用于记录用户求职画像、最近短板和历史事件，服务于 Agent 分析流程。
+- SQLite：保存在 `sql/job_fit.db`，用于结构化保存岗位、简历和匹配结果，服务于历史查询、统计和数据管理。
 
-**功能已完整恢复并测试通过！** 🎉
+## 当前边界
+
+- 目前已完成 Web 分析结果自动入库，但还没有单独的历史记录页面。
+- 查询示例以 SQL 文件和示例脚本为主，后续可以增加 FastAPI 查询接口。
+- 数据库保存的是规则分析后的结构化结果，不负责重新评分。
+- SQLite 适合本地单机项目；如果后续变成多人系统，可以迁移到 PostgreSQL。
